@@ -24,3 +24,11 @@ The provided `Makefile` compiles the starter code, `make` creates `libwatdfs.a, 
 ## RW Lock (Assignment 3)
 
 `rw_lock.cpp` and `rw_lock.h` contain the definition and implementation of a Reader-Writer lock, as described in the assignment specification, which may be helpful when completing Assignment 3. You should not need to modify `rw_lock.c` and `rw_lock.h`.
+
+
+
+
+./watdfs_server /tmp/watdfs_server_data
+./watdfs_client -f /tmp/watdfs_client_cache /tmp/watdfs_mount
+fusermount -u /tmp/watdfs_mount
+gdb --args ./watdfs_client -f /tmp/watdfs_client_cache /tmp/watdfs_mount
