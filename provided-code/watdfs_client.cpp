@@ -227,6 +227,7 @@ int watdfs_cli_open(void *userdata, const char *path,
     int fxn_ret = 0;
     if (rpc_ret < 0)
     {
+        DLOG("RPC call failed with error: %d", rpc_ret);
         fxn_ret = -EINVAL;
     }
     else
@@ -285,8 +286,79 @@ int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
 
     // Remember that size may be greater than the maximum array size of the RPC
     // library.
-    return -ENOSYS;
+    int ARG_COUNT = 6;
+
+    void **args = new void *[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+
+    // 0,4 STAYS SAME EVERYTIME
+    arg_types[0] =
+        (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)pathlen;
+    args[0] = (void *)path;
+
+    arg_types[4] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+                   (uint)sizeof(struct fuse_file_info);
+    args[4] = (void *)fi;
+
+    off_t curr_offset = offset;
+
+    unsigned long max_chunk_size = MAX_ARRAY_LEN;
+    unsigned long to_read = size;
+    int total = 0;
+
+    while (to_read > 0)
+    {
+        unsigned long this_chunk_size =
+            (to_read > max_chunk_size) ? max_chunk_size : to_read;
+
+        char *chunk_buf = buf + (size - to_read);
+        arg_types[1] =
+            (1u << ARG_OUTPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+            (uint)this_chunk_size;
+        args[1] = (void *)chunk_buf;
+
+        arg_types[2] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        args[2] = (void *)&this_chunk_size;
+
+        arg_types[3] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        args[3] = (void *)&curr_offset;
+
+        arg_types[5] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        int ret_bytes;
+        args[5] = (void *)&ret_bytes;
+
+        arg_types[6] = 0;
+
+        int rpc_ret = rpcCall((char *)"read", arg_types, args);
+        if (rpc_ret < 0)
+        {
+            delete[] args;
+
+            return -EINVAL;
+        }
+        if (ret_bytes < 0)
+        {
+            delete[] args;
+
+            return ret_bytes;
+        }
+        total += ret_bytes;
+        if (ret_bytes < this_chunk_size)
+        {
+            // We have read less than we wanted, so we are done.
+            break;
+        }
+        to_read -= this_chunk_size;
+        curr_offset += this_chunk_size;
+    }
+
+    delete[] args;
+
+    return total;
 }
+
 int watdfs_cli_write(void *userdata, const char *path, const char *buf,
                      size_t size, off_t offset, struct fuse_file_info *fi)
 {
@@ -294,7 +366,77 @@ int watdfs_cli_write(void *userdata, const char *path, const char *buf,
 
     // Remember that size may be greater than the maximum array size of the RPC
     // library.
-    return -ENOSYS;
+
+    int ARG_COUNT = 6;
+
+    void **args = new void *[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+
+    arg_types[0] =
+        (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)pathlen;
+    args[0] = (void *)path;
+
+    arg_types[4] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+                   (uint)sizeof(struct fuse_file_info);
+    args[4] = (void *)fi;
+
+    off_t curr_offset = offset;
+
+    unsigned long max_chunk_size = MAX_ARRAY_LEN;
+    unsigned long to_write = size;
+    int total = 0;
+
+    while (to_write > 0)
+    {
+        unsigned long this_chunk_size =
+            (to_write > max_chunk_size) ? max_chunk_size : to_write;
+
+        const char *chunk_buf = buf + (size - to_write);
+        arg_types[1] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+            (uint)this_chunk_size;
+        args[1] = (void *)chunk_buf;
+
+        arg_types[2] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        args[2] = (void *)&this_chunk_size;
+
+        arg_types[3] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        args[3] = (void *)&curr_offset;
+
+        arg_types[5] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        int ret_bytes;
+        args[5] = (void *)&ret_bytes;
+
+        arg_types[6] = 0;
+
+        int rpc_ret = rpcCall((char *)"write", arg_types, args);
+        if (rpc_ret < 0)
+        {
+            delete[] args;
+
+            return -EINVAL;
+        }
+        if (ret_bytes < 0)
+        {
+            delete[] args;
+
+            return ret_bytes;
+        }
+        total += ret_bytes;
+        if (ret_bytes < this_chunk_size)
+        {
+            // We have written less than we wanted, so we are done.
+            break;
+        }
+        to_write -= this_chunk_size;
+        curr_offset += this_chunk_size;
+    }
+
+    delete[] args;
+
+    return total;
 }
 int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize)
 {
