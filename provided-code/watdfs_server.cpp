@@ -155,6 +155,48 @@ int watdfs_release(int *argTypes, void **args)
     return 0;
 }
 
+int watdfs_read(int *argTypes, void **args)
+{
+    char *short_path = (char *)args[0];
+    char *buf = (char *)args[1];
+    size_t size = *(size_t *)args[2];
+    off_t offset = *(off_t *)args[3];
+    struct fuse_file_info *fi = (struct fuse_file_info *)args[4];
+    int *ret = (int *)args[5];
+
+    char *full_path = get_full_path(short_path);
+
+    ssize_t bytes = pread(fi->fh, buf, size, offset);
+    if (bytes < 0)
+        *ret = -errno;
+    else
+        *ret = (int)bytes;
+
+    free(full_path);
+    return 0;
+}
+
+int watdfs_write(int *argTypes, void **args)
+{
+    char *short_path = (char *)args[0];
+    const char *buf = (const char *)args[1];
+    size_t size = *(size_t *)args[2];
+    off_t offset = *(off_t *)args[3];
+    struct fuse_file_info *fi = (struct fuse_file_info *)args[4];
+    int *ret = (int *)args[5];
+
+    char *full_path = get_full_path(short_path);
+
+    ssize_t bytes = pwrite(fi->fh, buf, size, offset);
+    if (bytes < 0)
+        *ret = -errno;
+    else
+        *ret = (int)bytes;
+
+    free(full_path);
+    return 0;
+}
+
 // The main function of the server.
 int main(int argc, char *argv[])
 {
@@ -298,6 +340,58 @@ int main(int argc, char *argv[])
         }
     }
 
+    {
+        // detail).
+        int argTypes[7];
+        // First is the path.
+        argTypes[0] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | 1u;
+        // The second argument is the buffer.
+        argTypes[1] =
+            (1u << ARG_OUTPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)MAX_ARRAY_LEN;
+        // The third argument is the size.
+        argTypes[2] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        // The fourth argument is the offset.
+        argTypes[3] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        // The fifth argument is the fuse_file_info.
+        argTypes[4] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+            (uint)sizeof(struct fuse_file_info);
+        // The sixth argument is the retcode.
+        argTypes[5] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        argTypes[6] = 0;
+
+        std::cout << "Registering read..." << std::endl;
+        ret = rpcRegister((char *)"read", argTypes, watdfs_read);
+        if (ret < 0)
+        {
+            // It may be useful to have debug-printing here.
+            std::cerr << "Error registering read, return code: " << ret << std::endl;
+            return ret;
+        }
+    }
+
+    {
+        int argTypes[7];
+        argTypes[0] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | 1u;
+        argTypes[1] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)MAX_ARRAY_LEN;
+        argTypes[2] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        argTypes[3] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        argTypes[4] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+            (uint)sizeof(struct fuse_file_info);
+        argTypes[5] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        argTypes[6] = 0;
+        std::cout << "Registering write..." << std::endl;
+        ret = rpcRegister((char *)"write", argTypes, watdfs_write);
+        if (ret < 0)
+        {
+            std::cerr << "Error registering write, return code: " << ret << std::endl;
+            return ret;
+        }
+    }
     // TODO: Hand over control to the RPC library by calling `rpcExecute`.
     std::cout << "Starting RPC execution..." << std::endl;
     ret = rpcExecute();
