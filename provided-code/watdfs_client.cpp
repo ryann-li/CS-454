@@ -441,14 +441,72 @@ int watdfs_cli_write(void *userdata, const char *path, const char *buf,
 int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize)
 {
     // Change the file size to newsize.
-    return -ENOSYS;
+    int ARG_COUNT = 3;
+    void *args[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+    arg_types[0] =
+        (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)pathlen;
+    args[0] = (void *)path;
+
+    arg_types[1] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+    args[1] = (void *)&newsize;
+
+    arg_types[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+    int ret;
+    args[2] = (void *)&ret;
+
+    arg_types[3] = 0;
+
+    int rpc_ret = rpcCall((char *)"truncate", arg_types, args);
+
+    int fxn_ret = 0;
+    if (rpc_ret < 0)
+    {
+        std::cerr << "RPC call failed with error: " << rpc_ret << std::endl;
+        fxn_ret = -EINVAL;
+    }
+    else
+    {
+        fxn_ret = ret;
+    }
+    return fxn_ret;
 }
 
 int watdfs_cli_fsync(void *userdata, const char *path,
                      struct fuse_file_info *fi)
 {
     // Force a flush of file data.
-    return -ENOSYS;
+    int ARG_COUNT = 3;
+    void *args[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+    arg_types[0] =
+        (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)pathlen;
+    args[0] = (void *)path;
+
+    arg_types[1] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+                   (uint)sizeof(struct fuse_file_info);
+    args[1] = (void *)fi;
+
+    arg_types[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+    int ret;
+    args[2] = (void *)&ret;
+    arg_types[3] = 0;
+    int rpc_ret = rpcCall((char *)"fsync", arg_types, args);
+    int fxn_ret = 0;
+    if (rpc_ret < 0)
+    {
+        std::cout << "RPC call failed with error: " << rpc_ret << std::endl;
+        fxn_ret = -EINVAL;
+    }
+    else
+    {
+        fxn_ret = ret;
+    }
+    return fxn_ret;
 }
 
 // CHANGE METADATA
@@ -456,5 +514,34 @@ int watdfs_cli_utimensat(void *userdata, const char *path,
                          const struct timespec ts[2])
 {
     // Change file access and modification times.
-    return -ENOSYS;
+    int ARG_COUNT = 3;
+    void *args[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+    arg_types[0] =
+        (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)pathlen;
+    args[0] = (void *)path;
+
+    arg_types[1] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+                   (uint)(2 * sizeof(struct timespec));
+    args[1] = (void *)ts;
+
+    arg_types[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+    int ret;
+    args[2] = (void *)&ret;
+    arg_types[3] = 0;
+
+    int rpc_ret = rpcCall((char *)"utimensat", arg_types, args);
+    int fxn_ret = 0;
+    if (rpc_ret < 0)
+    {
+        std::cout << "RPC call failed with error: " << rpc_ret << std::endl;
+        fxn_ret = -EINVAL;
+    }
+    else
+    {
+        fxn_ret = ret;
+    }
+    return fxn_ret;
 }

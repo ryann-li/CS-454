@@ -68,7 +68,6 @@ int watdfs_getattr(int *argTypes, void **args)
 
     // TODO: Make the stat system call, which is the corresponding system call needed
     // to support getattr. You should use the statbuf as an argument to the stat system call.
-    std::cout << "RYAN: Performing stat on '" << full_path << "'" << std::endl;
     (void)statbuf;
     int sys_ret = stat(full_path, statbuf);
 
@@ -100,7 +99,6 @@ int watdfs_mknod(int *argTypes, void **args)
 
     *ret = 0;
 
-    std::cout << "RYAN: Performing mknod on '" << full_path << "'" << std::endl;
     int sys_ret = mknod(full_path, *mode, *dev);
     if (sys_ret < 0)
     {
@@ -197,6 +195,66 @@ int watdfs_write(int *argTypes, void **args)
     return 0;
 }
 
+int watdfs_truncate(int *argTypes, void **args)
+{
+    char *short_path = (char *)args[0];
+    off_t size = *(off_t *)args[1];
+    int *ret = (int *)args[2];
+
+    char *full_path = get_full_path(short_path);
+
+    *ret = 0;
+
+    int sys_ret = truncate(full_path, size);
+    if (sys_ret < 0)
+    {
+        *ret = -errno;
+    }
+
+    free(full_path);
+    return 0;
+}
+
+int watdfs_fsync(int *argTypes, void **args)
+{
+    char *short_path = (char *)args[0];
+    struct fuse_file_info *fi = (struct fuse_file_info *)args[1];
+    int *ret = (int *)args[2];
+
+    char *full_path = get_full_path(short_path);
+
+    *ret = 0;
+
+    int sys_ret = fsync(fi->fh);
+    if (sys_ret < 0)
+    {
+        *ret = -errno;
+    }
+
+    free(full_path);
+    return 0;
+}
+
+int watdfs_utimensat(int *argTypes, void **args)
+{
+    char *short_path = (char *)args[0];
+    struct timespec *tv = (struct timespec *)args[1];
+    int *ret = (int *)args[2];
+
+    char *full_path = get_full_path(short_path);
+
+    *ret = 0;
+
+    int sys_ret = utimensat(AT_FDCWD, full_path, tv, 0);
+    if (sys_ret < 0)
+    {
+        *ret = -errno;
+    }
+
+    free(full_path);
+    return 0;
+}
+
 // The main function of the server.
 int main(int argc, char *argv[])
 {
@@ -221,7 +279,6 @@ int main(int argc, char *argv[])
     // 'export SERVER_PORT' lines. Make sure you *do not* print anything
     // to *stdout* before calling `rpcServerInit`.
     // DLOG("Initializing server...");
-    std::cerr << "Initializing server..." << std::endl;
     rpcServerInit();
 
     int ret = 0;
@@ -250,7 +307,6 @@ int main(int argc, char *argv[])
         argTypes[3] = 0;
 
         // We need to register the function with the types and the name.
-        std::cout << "Registering getattr..." << std::endl;
         ret = rpcRegister((char *)"getattr", argTypes, watdfs_getattr);
         if (ret < 0)
         {
@@ -276,7 +332,6 @@ int main(int argc, char *argv[])
         argTypes[4] = 0;
 
         // We need to register the function with the types and the name.
-        std::cout << "Registering mknod..." << std::endl;
         ret = rpcRegister((char *)"mknod", argTypes, watdfs_mknod);
         if (ret < 0)
         {
@@ -303,7 +358,6 @@ int main(int argc, char *argv[])
         argTypes[3] = 0;
 
         // We need to register the function with the types and the name.
-        std::cout << "Registering open..." << std::endl;
         ret = rpcRegister((char *)"open", argTypes, watdfs_open);
         if (ret < 0)
         {
@@ -330,7 +384,6 @@ int main(int argc, char *argv[])
         argTypes[3] = 0;
 
         // We need to register the function with the types and the name.
-        std::cout << "Registering release..." << std::endl;
         ret = rpcRegister((char *)"release", argTypes, watdfs_release);
         if (ret < 0)
         {
@@ -361,7 +414,6 @@ int main(int argc, char *argv[])
         argTypes[5] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
         argTypes[6] = 0;
 
-        std::cout << "Registering read..." << std::endl;
         ret = rpcRegister((char *)"read", argTypes, watdfs_read);
         if (ret < 0)
         {
@@ -384,7 +436,6 @@ int main(int argc, char *argv[])
             (uint)sizeof(struct fuse_file_info);
         argTypes[5] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
         argTypes[6] = 0;
-        std::cout << "Registering write..." << std::endl;
         ret = rpcRegister((char *)"write", argTypes, watdfs_write);
         if (ret < 0)
         {
@@ -392,8 +443,54 @@ int main(int argc, char *argv[])
             return ret;
         }
     }
+    {
+        int argTypes[4];
+        argTypes[0] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | 1u;
+        argTypes[1] = (1u << ARG_INPUT) | (ARG_LONG << 16u);
+        argTypes[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        argTypes[3] = 0;
+        ret = rpcRegister((char *)"truncate", argTypes, watdfs_truncate);
+        if (ret < 0)
+        {
+            std::cerr << "Error registering truncate, return code: " << ret << std::endl;
+            return ret;
+        }
+    }
+    {
+        int argTypes[4];
+        argTypes[0] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | 1u;
+        argTypes[1] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+            (uint)sizeof(struct fuse_file_info);
+        argTypes[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        argTypes[3] = 0;
+        ret = rpcRegister((char *)"fsync", argTypes, watdfs_fsync);
+        if (ret < 0)
+        {
+            std::cerr << "Error registering fsync, return code: " << ret << std::endl;
+            return ret;
+        }
+    }
+    {
+        int argTypes[4];
+        argTypes[0] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | 1u;
+        argTypes[1] =
+            (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) |
+            (uint)(2 * sizeof(struct timespec));
+        argTypes[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        argTypes[3] = 0;
+        ret = rpcRegister((char *)"utimensat", argTypes, watdfs_utimensat);
+        if (ret < 0)
+        {
+            std::cerr << "Error registering utimensat, return code: " << ret << std::endl;
+            return ret;
+        }
+    }
+
     // TODO: Hand over control to the RPC library by calling `rpcExecute`.
-    std::cout << "Starting RPC execution..." << std::endl;
     ret = rpcExecute();
 
     // rpcExecute could fail, so you may want to have debug-printing here, and

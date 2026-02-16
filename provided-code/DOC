@@ -31,4 +31,5 @@ The provided `Makefile` compiles the starter code, `make` creates `libwatdfs.a, 
 ./watdfs_server /tmp/watdfs_server_data
 ./watdfs_client -f /tmp/watdfs_client_cache /tmp/watdfs_mount
 fusermount -u /tmp/watdfs_mount
-gdb --args ./watdfs_client -f /tmp/watdfs_client_cache /tmp/watdfs_mount
+gdb --args ./watdfs_client -f /tmp/watdfs_client_cache /tmp/
+zip -r ../watdfs_submit.zip Makefile *.cpp *.h DO
