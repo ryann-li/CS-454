@@ -16,6 +16,9 @@ INIT_LOG
 #include <cstdlib>
 #include <iostream>
 #include <fuse.h>
+#include "rw_lock.h"
+#include <map>
+#include <string>
 #define PRINT_ERR
 
 // Global state server_persist_dir.
@@ -30,6 +33,23 @@ char *server_persist_dir = nullptr;
 // server_persist_dir. The character array is allocated on the heap, therefore
 // it should be freed after use.
 // Tip: update this function to return a unique_ptr for automatic memory management.
+
+struct FileState
+{
+    int reader_count;
+    bool is_writing;
+    rw_lock_t *rw_lock;
+
+    FileState() : reader_count(0), is_writing(false)
+    {
+        rw_lock = new rw_lock_t;
+        rw_lock_init(rw_lock);
+    }
+};
+
+std::map<std::string, FileState *> global_state;
+pthread_mutex_t map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 char *get_full_path(char *short_path)
 {
     int short_path_len = strlen(short_path);
@@ -119,10 +139,59 @@ int watdfs_open(int *argTypes, void **args)
 
     *ret = 0;
 
+    // we allow multiple readers, but only one writer. Therefore, if the file is being written, then we return an error. If the file is being read, then we can allow another reader, but if the file is being written, then we return an error. If the file is not being read or written, then we can allow the reader or writer to access the file. You should update the global state of the file accordingly.
+    pthread_mutex_lock(&map_mutex);
+    if (fi->flags & O_WRONLY || fi->flags & O_RDWR)
+    {
+        // write, if there is a writer or reader, return error
+        if (global_state[short_path] != nullptr && (global_state[short_path]->is_writing || global_state[short_path]->reader_count > 0))
+        {
+            pthread_mutex_unlock(&map_mutex);
+            *ret = -EACCES;
+            free(full_path);
+            return 0;
+        }
+        else
+        {
+            if (global_state[short_path] == nullptr)
+            {
+                global_state[short_path] = new FileState();
+            }
+            global_state[short_path]->is_writing = true;
+        }
+    }
+    else
+    {
+        // read, if there is a writer, return error
+        if (global_state[short_path] != nullptr && global_state[short_path]->is_writing)
+        {
+            pthread_mutex_unlock(&map_mutex);
+            *ret = -EACCES;
+            free(full_path);
+            return 0;
+        }
+        else
+        {
+            if (global_state[short_path] == nullptr)
+            {
+                global_state[short_path] = new FileState();
+            }
+            global_state[short_path]->reader_count++;
+        }
+    }
+    pthread_mutex_unlock(&map_mutex);
+
     int sys_ret = open(full_path, fi->flags);
     if (sys_ret < 0)
     {
         *ret = -errno;
+        // ROLLBACK
+        pthread_mutex_lock(&map_mutex);
+        if (fi->flags & O_WRONLY || fi->flags & O_RDWR)
+            global_state[short_path]->is_writing = false;
+        else
+            global_state[short_path]->reader_count--;
+        pthread_mutex_unlock(&map_mutex);
     }
     else
     {
@@ -143,10 +212,35 @@ int watdfs_release(int *argTypes, void **args)
 
     *ret = 0;
 
+    // update the global state of the file accordingly, if there is a writer, then we set it to false. If there are readers, then we decrement the reader count.
+    pthread_mutex_lock(&map_mutex);
+    if (global_state[short_path] != nullptr)
+    {
+        if (global_state[short_path]->is_writing)
+        {
+            global_state[short_path]->is_writing = false;
+        }
+        else if (global_state[short_path]->reader_count > 0)
+        {
+            global_state[short_path]->reader_count--;
+        }
+    }
+    pthread_mutex_unlock(&map_mutex);
+
     int sys_ret = close(fi->fh);
     if (sys_ret < 0)
     {
         *ret = -errno;
+        // ROLLBACK
+        pthread_mutex_lock(&map_mutex);
+        if (global_state[short_path] != nullptr)
+        {
+            if (fi->flags & O_WRONLY || fi->flags & O_RDWR)
+                global_state[short_path]->is_writing = true;
+            else
+                global_state[short_path]->reader_count++;
+        }
+        pthread_mutex_unlock(&map_mutex);
     }
 
     free(full_path);
@@ -252,6 +346,55 @@ int watdfs_utimensat(int *argTypes, void **args)
     }
 
     free(full_path);
+    return 0;
+}
+
+// ─── Lock / Unlock RPCs (client-driven atomic transfers) ─────────────────────
+int watdfs_lock(int *argTypes, void **args)
+{
+    char *short_path = (char *)args[0];
+    int mode = *(int *)args[1];
+    int *ret = (int *)args[2];
+    *ret = 0;
+
+    pthread_mutex_lock(&map_mutex);
+    if (global_state.count(short_path) == 0 || global_state[short_path] == nullptr)
+    {
+        global_state[short_path] = new FileState();
+    }
+    rw_lock_t *lock = global_state[short_path]->rw_lock;
+    pthread_mutex_unlock(&map_mutex);
+
+    int lock_ret = rw_lock_lock(lock, (rw_lock_mode_t)mode);
+    if (lock_ret != 0)
+        *ret = -lock_ret;
+
+    return 0;
+}
+
+int watdfs_unlock(int *argTypes, void **args)
+{
+    char *short_path = (char *)args[0];
+    int mode = *(int *)args[1];
+    int *ret = (int *)args[2];
+    *ret = 0;
+
+    pthread_mutex_lock(&map_mutex);
+    rw_lock_t *lock = nullptr;
+    if (global_state.count(short_path) > 0 && global_state[short_path] != nullptr)
+        lock = global_state[short_path]->rw_lock;
+    pthread_mutex_unlock(&map_mutex);
+
+    if (lock == nullptr)
+    {
+        *ret = -EINVAL;
+        return 0;
+    }
+
+    int lock_ret = rw_lock_unlock(lock, (rw_lock_mode_t)mode);
+    if (lock_ret != 0)
+        *ret = -lock_ret;
+
     return 0;
 }
 
@@ -486,6 +629,35 @@ int main(int argc, char *argv[])
         if (ret < 0)
         {
             std::cerr << "Error registering utimensat, return code: " << ret << std::endl;
+            return ret;
+        }
+    }
+
+    // Register lock RPC: path, mode (int), retcode
+    {
+        int argTypes[4];
+        argTypes[0] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | 1u;
+        argTypes[1] = (1u << ARG_INPUT) | (ARG_INT << 16u);
+        argTypes[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        argTypes[3] = 0;
+        ret = rpcRegister((char *)"lock", argTypes, watdfs_lock);
+        if (ret < 0)
+        {
+            std::cerr << "Error registering lock, return code: " << ret << std::endl;
+            return ret;
+        }
+    }
+    // Register unlock RPC: path, mode (int), retcode
+    {
+        int argTypes[4];
+        argTypes[0] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | 1u;
+        argTypes[1] = (1u << ARG_INPUT) | (ARG_INT << 16u);
+        argTypes[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        argTypes[3] = 0;
+        ret = rpcRegister((char *)"unlock", argTypes, watdfs_unlock);
+        if (ret < 0)
+        {
+            std::cerr << "Error registering unlock, return code: " << ret << std::endl;
             return ret;
         }
     }
