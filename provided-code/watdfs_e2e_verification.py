@@ -871,7 +871,7 @@ def test_e2e_one_reader_one_writer_permissions(dirs, server_addr=None, server_po
     writer_proc = None
     reader_proc = None
 
-    test_filename = "asdf.txt"
+    test_filename = "asdf_permissions.txt"
     writer_mount_file = dirs["mount1"] / test_filename
     reader_mount_file = dirs["mount2"] / test_filename
 
@@ -976,7 +976,7 @@ def test_e2e_one_reader_one_writer_caching(dirs, server_addr=None, server_port=N
     writer_proc = None
     reader_proc = None
 
-    test_filename = "asdf.txt"
+    test_filename = "asdf_caching.txt"
     writer_mount_file = dirs["mount1"] / test_filename
     reader_mount_file = dirs["mount2"] / test_filename
     initial_data = b"old-data"
@@ -993,9 +993,24 @@ def test_e2e_one_reader_one_writer_caching(dirs, server_addr=None, server_port=N
             raise AssertionError("Failed to start reader client")
 
         print("  🧪 Priming reader cache with old data...")
-        fd_prime_w = os.open(str(writer_mount_file), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
-        os.write(fd_prime_w, initial_data)
-        os.close(fd_prime_w)
+        # Retry for transient EACCES caused by async release timing in prior tests.
+        prime_write_ok = False
+        last_prime_error = None
+        for attempt in range(8):
+            try:
+                fd_prime_w = os.open(str(writer_mount_file), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+                os.write(fd_prime_w, initial_data)
+                os.close(fd_prime_w)
+                prime_write_ok = True
+                break
+            except OSError as e:
+                last_prime_error = e
+                if e.errno == errno.EACCES:
+                    time.sleep(0.25)
+                    continue
+                raise
+        if not prime_write_ok:
+            raise AssertionError(f"Priming write failed after retries: {last_prime_error}")
 
         fd_prime_r = os.open(str(reader_mount_file), os.O_CREAT | os.O_RDONLY, 0o644)
         _ = os.read(fd_prime_r, 4096)
@@ -1098,6 +1113,199 @@ def _open_only_worker(file_path: str, flags: int, mode: int, result_queue):
         result_queue.put({"ok": False, "errno": e.errno, "error": str(e), "duration_sec": end_ts - start_ts})
 
 
+def _read_all_from_path(file_path: str, max_bytes: int = 1024 * 1024 + 256 * 1024) -> bytes:
+    """Read file contents from a path with an upper bound for safety."""
+    fd = os.open(file_path, os.O_CREAT | os.O_RDONLY, 0o644)
+    try:
+        chunks = []
+        total = 0
+        while total < max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _atomicity_writer_worker(file_path: str, result_queue):
+    """Writer worker for atomicity: open for write, write large data, close."""
+    payload = (b"NEW-DATA-" * 100000)[:700000]
+    start_ts = time.time()
+    try:
+        fd = os.open(file_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+        open_done_ts = time.time()
+
+        offset = 0
+        chunk_size = 32768
+        while offset < len(payload):
+            wrote = os.write(fd, payload[offset:offset + chunk_size])
+            if wrote <= 0:
+                raise OSError(errno.EIO, "write returned non-positive byte count")
+            offset += wrote
+
+        os.fsync(fd)
+        os.close(fd)
+
+        result_queue.put({
+            "ok": True,
+            "open_duration_sec": open_done_ts - start_ts,
+            "write_size": len(payload),
+        })
+    except OSError as e:
+        result_queue.put({"ok": False, "errno": e.errno, "error": str(e)})
+    except Exception as e:
+        result_queue.put({"ok": False, "errno": None, "error": str(e)})
+
+
+def _atomicity_reader_worker(file_path: str, duration_sec: float, result_queue):
+    """Reader worker for atomicity: repeatedly open/read while writer runs."""
+    old_payload = (b"OLD-DATA-" * 100000)[:655350]
+    new_payload = (b"NEW-DATA-" * 100000)[:700000]
+
+    old_count = 0
+    new_count = 0
+    mixed_count = 0
+    read_errors = 0
+    total_reads = 0
+
+    end_time = time.time() + duration_sec
+    while time.time() < end_time:
+        try:
+            data = _read_all_from_path(file_path)
+            total_reads += 1
+            if data == old_payload:
+                old_count += 1
+            elif data == new_payload:
+                new_count += 1
+            else:
+                mixed_count += 1
+        except OSError:
+            read_errors += 1
+        time.sleep(0.1)
+
+    result_queue.put({
+        "ok": True,
+        "total_reads": total_reads,
+        "old_count": old_count,
+        "new_count": new_count,
+        "mixed_count": mixed_count,
+        "read_errors": read_errors,
+    })
+
+
+def test_e2e_atomicity_parallel(dirs, server_addr=None, server_port=None):
+    """Mimic release9 atomicity: 1 writer + 2 readers in parallel, no mixed reads."""
+    print("🧪 TEST: e2e_atomicity_parallel")
+
+    if not server_addr or not server_port:
+        raise AssertionError("Server connection info is required for multi-client atomicity test")
+
+    reader_client_1 = None
+    reader_client_2 = None
+    writer_proc = None
+    reader_proc_1 = None
+    reader_proc_2 = None
+
+    filename = "atomicity_test.bin"
+    server_file = dirs["server"] / filename
+    writer_path = dirs["mount"] / filename
+    reader_path_1 = dirs["mount1"] / filename
+    reader_path_2 = dirs["mount2"] / filename
+
+    old_payload = (b"OLD-DATA-" * 100000)[:655350]
+
+    try:
+        print("  🚀 Starting 2 reader clients...")
+        reader_client_1 = start_client(dirs, 1, server_addr, server_port)
+        if reader_client_1 is None:
+            raise AssertionError("Failed to start reader client 1")
+
+        reader_client_2 = start_client(dirs, 2, server_addr, server_port)
+        if reader_client_2 is None:
+            raise AssertionError("Failed to start reader client 2")
+
+        print(f"  📁 Creating server file with old data (size={len(old_payload)})...")
+        with open(server_file, "wb") as f:
+            f.write(old_payload)
+
+        ctx = mp.get_context("fork")
+        writer_q = ctx.Queue()
+        reader_q_1 = ctx.Queue()
+        reader_q_2 = ctx.Queue()
+
+        print("  🏁 Starting writer and two readers in parallel...")
+        writer_proc = ctx.Process(target=_atomicity_writer_worker, args=(str(writer_path), writer_q))
+        reader_proc_1 = ctx.Process(target=_atomicity_reader_worker, args=(str(reader_path_1), 8.0, reader_q_1))
+        reader_proc_2 = ctx.Process(target=_atomicity_reader_worker, args=(str(reader_path_2), 8.0, reader_q_2))
+
+        writer_proc.start()
+        reader_proc_1.start()
+        reader_proc_2.start()
+
+        writer_proc.join(timeout=40)
+        reader_proc_1.join(timeout=40)
+        reader_proc_2.join(timeout=40)
+
+        if writer_proc.is_alive():
+            writer_proc.terminate()
+            writer_proc.join(timeout=2)
+            raise AssertionError("Writer process timed out (possible deadlock in open/sync path)")
+        if reader_proc_1.is_alive() or reader_proc_2.is_alive():
+            if reader_proc_1.is_alive():
+                reader_proc_1.terminate()
+                reader_proc_1.join(timeout=2)
+            if reader_proc_2.is_alive():
+                reader_proc_2.terminate()
+                reader_proc_2.join(timeout=2)
+            raise AssertionError("Reader process timed out")
+
+        if writer_q.empty() or reader_q_1.empty() or reader_q_2.empty():
+            raise AssertionError("Missing result from writer/readers")
+
+        writer_result = writer_q.get_nowait()
+        r1 = reader_q_1.get_nowait()
+        r2 = reader_q_2.get_nowait()
+
+        if not writer_result.get("ok", False):
+            raise AssertionError(
+                f"Writer failed: errno={writer_result.get('errno')} error={writer_result.get('error')}"
+            )
+
+        writer_open_sec = float(writer_result.get("open_duration_sec", 0.0))
+        print(f"  ⏱️  Writer open duration: {writer_open_sec:.3f}s")
+        if writer_open_sec > 3.0:
+            raise AssertionError(f"Writer open took too long ({writer_open_sec:.3f}s), possible lock contention/deadlock")
+
+        for idx, reader_result in enumerate([r1, r2], start=1):
+            if not reader_result.get("ok", False):
+                raise AssertionError(f"Reader {idx} worker failed")
+            if reader_result.get("total_reads", 0) == 0:
+                raise AssertionError(f"Reader {idx} did not complete any reads")
+            if reader_result.get("mixed_count", 0) > 0:
+                raise AssertionError(
+                    f"Reader {idx} observed mixed/partial content {reader_result.get('mixed_count')} time(s)"
+                )
+
+        print(f"  📊 Reader1 stats: {r1}")
+        print(f"  📊 Reader2 stats: {r2}")
+        print("  ✅ No mixed reads observed during concurrent writer/readers")
+        print("✅ PASSED ✅ - e2e_atomicity_parallel")
+
+    finally:
+        for proc in [writer_proc, reader_proc_1, reader_proc_2]:
+            if proc is not None and proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2)
+
+        terminate_process(reader_client_1)
+        terminate_process(reader_client_2)
+        fusermount_u(dirs["mount1"])
+        fusermount_u(dirs["mount2"])
+
+
 def test_e2e_double_client_double_open_fail(dirs, server_addr=None, server_port=None):
     """Marmoset release2: second writer open from another client should fail quickly, not timeout."""
     print("🧪 TEST: e2e_double_client_double_open_fail")
@@ -1110,7 +1318,7 @@ def test_e2e_double_client_double_open_fail(dirs, server_addr=None, server_port=
     writer_proc = None
     second_open_proc = None
 
-    test_filename = "asdf.txt"
+    test_filename = "asdf_double_open.txt"
     writer_mount_file = dirs["mount1"] / test_filename
     second_mount_file = dirs["mount2"] / test_filename
 
@@ -1263,6 +1471,7 @@ def main():
             ("e2e_utime", test_e2e_utime),
             ("e2e_one_reader_one_writer_permissions", test_e2e_one_reader_one_writer_permissions),
             ("e2e_one_reader_one_writer_caching", test_e2e_one_reader_one_writer_caching),
+            ("e2e_atomicity_parallel", test_e2e_atomicity_parallel),
         ]
         all_tests = tests.copy()
         

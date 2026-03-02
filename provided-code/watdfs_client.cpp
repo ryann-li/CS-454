@@ -478,8 +478,33 @@ int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi)
         return server_ret;
     }
 
+    int access_mode = fi->flags & O_ACCMODE;
+    struct fuse_file_info sync_fi = *fi;
+    bool opened_temp_sync_handle = false;
+
+    // sync_cache may need to read from the server; for write-mode opens,
+    // the server fh from open_p1 is not guaranteed to be readable.
+    if (access_mode == O_WRONLY || access_mode == O_RDWR)
+    {
+        memset(&sync_fi, 0, sizeof(sync_fi));
+        sync_fi.flags = O_RDONLY;
+        int sync_open_ret = watdfs_cli_open_p1(userdata, path, &sync_fi);
+        if (sync_open_ret < 0)
+        {
+            watdfs_cli_release_p1(userdata, path, fi);
+            return sync_open_ret;
+        }
+        opened_temp_sync_handle = true;
+    }
+
     // 3. Freshness: sync_cache ensures local cache file is up-to-date.
-    int sc_ret = sync_cache(userdata, path, fi);
+    int sc_ret = sync_cache(userdata, path, &sync_fi);
+
+    if (opened_temp_sync_handle)
+    {
+        watdfs_cli_release_p1(userdata, path, &sync_fi);
+    }
+
     if (sc_ret < 0)
     {
         // Rollback: release on server since we can't proceed locally.
