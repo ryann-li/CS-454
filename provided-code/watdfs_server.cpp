@@ -36,11 +36,10 @@ char *server_persist_dir = nullptr;
 
 struct FileState
 {
-    int reader_count;
-    bool is_writing;
+    int open_writers;
     rw_lock_t *rw_lock;
 
-    FileState() : reader_count(0), is_writing(false)
+    FileState() : open_writers(0)
     {
         rw_lock = new rw_lock_t;
         rw_lock_init(rw_lock);
@@ -139,45 +138,33 @@ int watdfs_open(int *argTypes, void **args)
 
     *ret = 0;
 
-    // we allow multiple readers, but only one writer. Therefore, if the file is being written, then we return an error. If the file is being read, then we can allow another reader, but if the file is being written, then we return an error. If the file is not being read or written, then we can allow the reader or writer to access the file. You should update the global state of the file accordingly.
+    int access_mode = fi->flags & O_ACCMODE;
+    bool is_writer_open = (access_mode == O_WRONLY || access_mode == O_RDWR);
+
+    FileState *state = nullptr;
     pthread_mutex_lock(&map_mutex);
-    if (fi->flags & O_WRONLY || fi->flags & O_RDWR)
+    auto state_it = global_state.find(short_path);
+    if (state_it == global_state.end() || state_it->second == nullptr)
     {
-        // write, if there is a writer or reader, return error
-        if (global_state[short_path] != nullptr && (global_state[short_path]->is_writing || global_state[short_path]->reader_count > 0))
-        {
-            pthread_mutex_unlock(&map_mutex);
-            *ret = -EACCES;
-            free(full_path);
-            return 0;
-        }
-        else
-        {
-            if (global_state[short_path] == nullptr)
-            {
-                global_state[short_path] = new FileState();
-            }
-            global_state[short_path]->is_writing = true;
-        }
+        state = new FileState();
+        global_state[short_path] = state;
     }
     else
     {
-        // read, if there is a writer, return error
-        if (global_state[short_path] != nullptr && global_state[short_path]->is_writing)
-        {
-            pthread_mutex_unlock(&map_mutex);
-            *ret = -EACCES;
-            free(full_path);
-            return 0;
-        }
-        else
-        {
-            if (global_state[short_path] == nullptr)
-            {
-                global_state[short_path] = new FileState();
-            }
-            global_state[short_path]->reader_count++;
-        }
+        state = state_it->second;
+    }
+
+    // Fast-fail only for concurrent writer opens.
+    if (is_writer_open && state->open_writers > 0)
+    {
+        pthread_mutex_unlock(&map_mutex);
+        *ret = -EACCES;
+        free(full_path);
+        return 0;
+    }
+    if (is_writer_open)
+    {
+        state->open_writers++;
     }
     pthread_mutex_unlock(&map_mutex);
 
@@ -185,13 +172,16 @@ int watdfs_open(int *argTypes, void **args)
     if (sys_ret < 0)
     {
         *ret = -errno;
-        // ROLLBACK
-        pthread_mutex_lock(&map_mutex);
-        if (fi->flags & O_WRONLY || fi->flags & O_RDWR)
-            global_state[short_path]->is_writing = false;
-        else
-            global_state[short_path]->reader_count--;
-        pthread_mutex_unlock(&map_mutex);
+        if (is_writer_open)
+        {
+            pthread_mutex_lock(&map_mutex);
+            auto rollback_it = global_state.find(short_path);
+            if (rollback_it != global_state.end() && rollback_it->second != nullptr && rollback_it->second->open_writers > 0)
+            {
+                rollback_it->second->open_writers--;
+            }
+            pthread_mutex_unlock(&map_mutex);
+        }
     }
     else
     {
@@ -212,33 +202,22 @@ int watdfs_release(int *argTypes, void **args)
 
     *ret = 0;
 
-    // update the global state of the file accordingly, if there is a writer, then we set it to false. If there are readers, then we decrement the reader count.
-    pthread_mutex_lock(&map_mutex);
-    if (global_state[short_path] != nullptr)
-    {
-        if (global_state[short_path]->is_writing)
-        {
-            global_state[short_path]->is_writing = false;
-        }
-        else if (global_state[short_path]->reader_count > 0)
-        {
-            global_state[short_path]->reader_count--;
-        }
-    }
-    pthread_mutex_unlock(&map_mutex);
+    int access_mode = fi->flags & O_ACCMODE;
+    bool is_writer_open = (access_mode == O_WRONLY || access_mode == O_RDWR);
 
     int sys_ret = close(fi->fh);
     if (sys_ret < 0)
     {
         *ret = -errno;
-        // ROLLBACK
+    }
+
+    if (is_writer_open)
+    {
         pthread_mutex_lock(&map_mutex);
-        if (global_state[short_path] != nullptr)
+        auto state_it = global_state.find(short_path);
+        if (state_it != global_state.end() && state_it->second != nullptr && state_it->second->open_writers > 0)
         {
-            if (fi->flags & O_WRONLY || fi->flags & O_RDWR)
-                global_state[short_path]->is_writing = true;
-            else
-                global_state[short_path]->reader_count++;
+            state_it->second->open_writers--;
         }
         pthread_mutex_unlock(&map_mutex);
     }

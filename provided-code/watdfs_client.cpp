@@ -22,6 +22,8 @@ struct ActiveSession
 {
     int local_fd;
     int flags;
+    uint64_t server_fh; // server-side file handle returned by
+    struct fuse_file_info fi;
 };
 
 struct watdfs_cli_state
@@ -43,13 +45,14 @@ int upload_file(void *userdata, const char *cache_path, const char *server_path,
 int watdfs_cli_release_p1(void *userdata, const char *path, struct fuse_file_info *fi);
 int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi);
 int watdfs_cli_release(void *userdata, const char *path, struct fuse_file_info *fi);
+static int sync_cache(void *userdata, const char *path, struct fuse_file_info *fi);
 
 // SETUP AND TEARDOWN
 void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
                       time_t cache_interval, int *ret_code)
 {
     // TODO: set up the RPC library by calling `rpcClientInit`.
-    std::cout << "Initializing RPC Client..." << std::endl;
+    // std::cout << "Initializing RPC Client..." << std::endl;
 
     int ret = rpcClientInit();
 
@@ -95,7 +98,7 @@ static int rpc_getattr(void *userdata, const char *path, struct stat *statbuf)
 {
     // SET UP THE RPC CALL
     DLOG("rpc_getattr called for '%s'", path);
-    std::cout << "rpc_getattr called for '" << path << "'" << std::endl;
+    // std::cout << "rpc_getattr called for '" << path << "'" << std::endl;
 
     // getattr has 3 arguments.
     int ARG_COUNT = 3;
@@ -144,7 +147,7 @@ static int rpc_getattr(void *userdata, const char *path, struct stat *statbuf)
     // MAKE THE RPC CALL
     int rpc_ret = rpcCall((char *)"getattr", arg_types, args);
 
-    std::cout << "watdfs_cli_getattr RPC call returned " << rpc_ret << ", server ret code: " << ret << std::endl;
+    // std::cout << "watdfs_cli_getattr RPC call returned " << rpc_ret << ", server ret code: " << ret << std::endl;
 
     // HANDLE THE RETURN
     // The integer value watdfs_cli_getattr will return.
@@ -184,13 +187,25 @@ static int rpc_getattr(void *userdata, const char *path, struct stat *statbuf)
 // GET FILE ATTRIBUTES (FUSE wrapper: open->stat->release if not already open)
 int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf)
 {
+    DLOG("GETATTR called on %s", path);
     watdfs_cli_state *state = (watdfs_cli_state *)userdata;
     std::string path_str(path);
     std::string full_cache_path = state->cache_path + path_str;
 
     if (state->active_sessions.count(path_str) > 0)
     {
-        // File is open: stat the local cache file.
+        ActiveSession &sess = state->active_sessions[path_str];
+        // For read-only open files, check freshness so a stale cache is refreshed.
+        // (Writers manage their own view; no server refresh needed while writing.)
+        if ((sess.flags & O_ACCMODE) == O_RDONLY)
+        {
+            struct fuse_file_info server_fi;
+            memset(&server_fi, 0, sizeof(server_fi));
+            server_fi.fh = sess.server_fh;
+            server_fi.flags = sess.flags;
+            sync_cache(userdata, path, &server_fi);
+        }
+        // Stat the (possibly just-refreshed) local cache file.
         int ret = stat(full_cache_path.c_str(), statbuf);
         return (ret < 0) ? -errno : 0;
     }
@@ -204,8 +219,14 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf)
         int open_ret = watdfs_cli_open(userdata, path, &tmp_fi);
         if (open_ret < 0)
         {
-            // If open fails (e.g., directory or non-existent), fall back to server RPC.
-            return rpc_getattr(userdata, path, statbuf);
+            // If open fails with -EACCES (file locked by writer), fall back to server RPC
+            // to get metadata without needing to open the file
+            if (open_ret == -EACCES)
+            {
+                return rpc_getattr(userdata, path, statbuf);
+            }
+            // For other errors (e.g., file doesn't exist), return the error
+            return open_ret;
         }
 
         int ret = stat(full_cache_path.c_str(), statbuf);
@@ -466,22 +487,29 @@ int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi)
         return sc_ret;
     }
 
-    // 4. Open the local cache file with the FUSE-provided flags.
+    // 4. Save the server-side FH before opening the local cache file.
+    // fi->fh is the server FH here (set by watdfs_cli_open_p1).
+    uint64_t server_fh = fi->fh;
+
+    // 5. Open the local cache file with the FUSE-provided flags.
     int local_fd = open(full_cache_path.c_str(), fi->flags);
     if (local_fd < 0)
     {
         int saved_errno = errno;
+        // fi->fh is still server_fh here — correct for the release RPC.
         watdfs_cli_release_p1(userdata, path, fi);
         return -saved_errno;
     }
 
-    // 5. Overwrite fi->fh with the local FD.
+    // 6. Overwrite fi->fh with the local FD (what FUSE will use for reads/writes).
     fi->fh = (uint64_t)local_fd;
 
-    // 6. Update session map (store both fd and flags).
+    // 7. Update session map (store fd, flags, and server_fh).
     ActiveSession session;
     session.local_fd = local_fd;
     session.flags = fi->flags;
+    session.server_fh = server_fh;
+    session.fi = *fi; // Copy the contents
     state->active_sessions[path_str] = session;
 
     return 0;
@@ -573,14 +601,19 @@ int watdfs_cli_release(void *userdata, const char *path,
     ActiveSession &session = state->active_sessions[path_str];
     int access_mode = session.flags & O_ACCMODE;
 
+    // Build a fi copy carrying the server-side FH for all server RPCs.
+    // (fi->fh has been overwritten with the local_fd since watdfs_cli_open.)
+    struct fuse_file_info server_fi = *fi;
+    server_fi.fh = session.server_fh;
+
     // 1. If opened in Write or RW mode, upload the file before closing.
     if (access_mode != O_RDONLY)
     {
-        int up_ret = upload_file(userdata, full_cache_path.c_str(), path, fi);
+        int up_ret = upload_file(userdata, full_cache_path.c_str(), path, &server_fi);
         if (up_ret < 0)
         {
             // Still release and close, but propagate upload error.
-            watdfs_cli_release_p1(userdata, path, fi);
+            watdfs_cli_release_p1(userdata, path, &server_fi);
             close(session.local_fd);
             state->active_sessions.erase(path_str);
             return up_ret;
@@ -590,9 +623,9 @@ int watdfs_cli_release(void *userdata, const char *path,
     }
 
     // 2. Server release RPC (updates SWMR state on server).
-    int server_ret = watdfs_cli_release_p1(userdata, path, fi);
+    int server_ret = watdfs_cli_release_p1(userdata, path, &server_fi);
 
-    // 3. Close the local FD.
+    // 3. Close the local FD.2
     close(session.local_fd);
 
     // 4. Erase the session, but keep Tc in cache_metadata.
@@ -626,7 +659,11 @@ int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
         else
         {
             // Read-only mode: sync cache first, then read locally.
-            int sc_ret = sync_cache(userdata, path, fi);
+            // sync_cache -> download_file uses fi->fh as a server FD;
+            // use server_fh so the server pread targets the right descriptor.
+            struct fuse_file_info server_fi = *fi;
+            server_fi.fh = state->active_sessions[path_str].server_fh;
+            int sc_ret = sync_cache(userdata, path, &server_fi);
             if (sc_ret < 0)
                 return sc_ret;
 
@@ -655,6 +692,7 @@ int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
 int watdfs_cli_write(void *userdata, const char *path, const char *buf,
                      size_t size, off_t offset, struct fuse_file_info *fi)
 {
+    DLOG("WRITE called on %s, size=%zu, offset=%ld", path, size, offset);
     watdfs_cli_state *state = (watdfs_cli_state *)userdata;
     std::string path_str(path);
     std::string full_cache_path = state->cache_path + path_str;
@@ -692,13 +730,65 @@ int watdfs_cli_write(void *userdata, const char *path, const char *buf,
 
         if (need_upload)
         {
-            upload_file(userdata, full_cache_path.c_str(), path, fi);
+            struct fuse_file_info server_fi = *fi;
+            server_fi.fh = state->active_sessions[path_str].server_fh;
+            upload_file(userdata, full_cache_path.c_str(), path, &server_fi);
         }
         state->cache_metadata[path_str] = time(nullptr);
     }
 
     return (int)bytes;
 }
+
+int check_and_upload_if_expired(void *userdata, const char *path, struct fuse_file_info *fi)
+{
+    time_t now = time(nullptr);
+    watdfs_cli_state *state = (watdfs_cli_state *)userdata;
+    std::string path_str(path); // Use string only for map lookups
+    std::string full_cache_path = state->cache_path + path_str;
+
+    time_t Tc = 0;
+    if (state->cache_metadata.count(path_str) > 0)
+        Tc = state->cache_metadata[path_str];
+
+    if ((now - Tc) >= state->cache_interval)
+    {
+        struct stat server_stat;
+        // 1. Use 'path' (the const char*) not 'path_str'
+        int ga_ret = rpc_getattr(userdata, path, &server_stat);
+
+        bool need_upload = true;
+        if (ga_ret == 0)
+        {
+            struct stat local_stat;
+            if (stat(full_cache_path.c_str(), &local_stat) == 0)
+            {
+                if (local_stat.st_mtime == server_stat.st_mtime)
+                {
+                    need_upload = false;
+                }
+            }
+        }
+
+        int ret = 0;
+        if (need_upload)
+        {
+            // 2. Build the server_fi but don't use pointers to stack memory
+            struct fuse_file_info server_fi = *fi;
+            server_fi.fh = state->active_sessions[path_str].server_fh;
+
+            // 3. Call upload_file using 'path' (const char*)
+            // 4. Update 'ret' without redeclaring it (no 'int')
+            // ret = upload_file(userdata, full_cache_path.c_str(), path, &server_fi);
+            ret = -1;
+        }
+
+        state->cache_metadata[path_str] = time(nullptr);
+        return ret;
+    }
+    return 0;
+}
+
 int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize)
 {
     watdfs_cli_state *state = (watdfs_cli_state *)userdata;
@@ -707,13 +797,27 @@ int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize)
 
     if (state->active_sessions.count(path_str) > 0)
     {
-        // File is open: truncate the local cache file.
+        // log
+        DLOG("1. Truncating file %s to size %ld", path, newsize);
+        ActiveSession &session = state->active_sessions[path_str];
+        if ((session.flags & O_ACCMODE) == O_RDONLY)
+            return -EMFILE;
+
+        // 1. Truncate locally
         int ret = truncate(full_cache_path.c_str(), newsize);
-        return (ret < 0) ? -errno : 0;
+        if (ret < 0)
+            return -errno;
+
+        // 2. IMPORTANT: Check freshness and UPLOAD if interval expired
+        // This ensures the server eventually sees the truncation.
+        check_and_upload_if_expired(userdata, path, &session.fi);
+
+        return 0;
     }
     else
     {
-        // File is not open: open(WRONLY) -> truncate local -> upload -> release.
+        // Path-based logic for closed files: Open -> Truncate -> Release (Uploads)
+        DLOG("2. Truncating file %s to size %ld", path, newsize);
         struct fuse_file_info tmp_fi;
         memset(&tmp_fi, 0, sizeof(tmp_fi));
         tmp_fi.flags = O_WRONLY;
@@ -723,15 +827,48 @@ int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize)
             return open_ret;
 
         int ret = truncate(full_cache_path.c_str(), newsize);
-        int trunc_result = (ret < 0) ? -errno : 0;
+        int result = (ret < 0) ? -errno : 0;
 
-        // Upload the truncated file back to the server.
-        if (trunc_result == 0)
-            upload_file(userdata, full_cache_path.c_str(), path, &tmp_fi);
-
-        watdfs_cli_release(userdata, path, &tmp_fi);
-        return trunc_result;
+        watdfs_cli_release(userdata, path, &tmp_fi); // This triggers the server sync
+        return result;
     }
+}
+
+int watdfs_cli_ftruncate(void *userdata, const char *path, off_t newsize,
+                         struct fuse_file_info *fi)
+{
+    DLOG("ftruncate called on %s, newsize=%ld", path, newsize);
+
+    watdfs_cli_state *state = (watdfs_cli_state *)userdata;
+    std::string path_str(path);
+
+    // For ftruncate, we already have an open file handle
+    if (fi == NULL)
+    {
+        DLOG("ftruncate: fi is NULL");
+        return -EBADF;
+    }
+
+    // Get session for this file handle using the path
+    auto session_iter = state->active_sessions.find(path_str);
+    if (session_iter == state->active_sessions.end())
+    {
+        DLOG("ftruncate: No active session for path %s", path);
+        return -EBADF;
+    }
+
+    ActiveSession &session = session_iter->second;
+
+    // Use ftruncate on the local file descriptor
+    int result = ftruncate(session.local_fd, newsize);
+    if (result < 0)
+    {
+        DLOG("ftruncate failed on local cache: %s", strerror(errno));
+        return -errno;
+    }
+
+    DLOG("ftruncate succeeded on %s", path);
+    return 0;
 }
 
 int watdfs_cli_fsync(void *userdata, const char *path,
@@ -757,7 +894,9 @@ int watdfs_cli_fsync(void *userdata, const char *path,
     }
 
     // Writable file: upload immediately and update Tc.
-    int up_ret = upload_file(userdata, full_cache_path.c_str(), path, fi);
+    struct fuse_file_info server_fi = *fi;
+    server_fi.fh = session.server_fh;
+    int up_ret = upload_file(userdata, full_cache_path.c_str(), path, &server_fi);
     if (up_ret < 0)
         return up_ret;
 
@@ -775,9 +914,38 @@ int watdfs_cli_utimensat(void *userdata, const char *path,
 
     if (state->active_sessions.count(path_str) > 0)
     {
-        // File is open: set timestamps on local cache file.
+        // 1. Check if we have permission to write (Section 7.1.6)
+        ActiveSession &sess = state->active_sessions[path_str];
+        if ((sess.flags & O_ACCMODE) == O_RDONLY)
+        {
+            return -EMFILE;
+        }
+
+        // 2. Set timestamps on local cache file
         int ret = utimensat(AT_FDCWD, full_cache_path.c_str(), ts, 0);
-        return (ret < 0) ? -errno : 0;
+        if (ret < 0)
+            return -errno;
+
+        // 3. Freshness Check (Section 7.1.5)
+        time_t now = time(nullptr);
+        time_t Tc = state->cache_metadata[path_str];
+
+        if ((now - Tc) >= state->cache_interval)
+        {
+            // Use the server-side FH we stored during open
+            struct fuse_file_info server_fi;
+            memset(&server_fi, 0, sizeof(server_fi));
+            server_fi.fh = sess.server_fh;
+            server_fi.flags = sess.flags;
+
+            // This will now push the data AND the new timestamps (due to your upload_file fix)
+            upload_file(userdata, full_cache_path.c_str(), path, &server_fi);
+
+            // Renew the lease
+            state->cache_metadata[path_str] = time(nullptr);
+        }
+
+        return 0;
     }
     else
     {
@@ -978,14 +1146,36 @@ int upload_file(void *userdata, const char *cache_path, const char *server_path,
         offset += bytes_written;
     }
 
-    // Align local mtime with server's mtime after upload.
-    struct stat server_stat;
-    if (rpc_getattr(userdata, server_path, &server_stat) == 0)
+    // Preserve local file timestamps on the server (for utimens compatibility)
+    struct stat local_stat;
+    if (stat(cache_path, &local_stat) == 0)
     {
-        struct utimbuf ut;
-        ut.actime = server_stat.st_atime;
-        ut.modtime = server_stat.st_mtime;
-        utime(cache_path, &ut);
+        // Use server-side utimensat to set the server file's timestamps
+        // to match what the local cache file has (which includes utimens changes)
+        struct timespec ts[2];
+        ts[0].tv_sec = local_stat.st_atime;
+        ts[0].tv_nsec = 0;
+        ts[1].tv_sec = local_stat.st_mtime;
+        ts[1].tv_nsec = 0;
+
+        // RPC call to set server timestamps
+        int ARG_COUNT = 3;
+        void *args[ARG_COUNT];
+        int arg_types[ARG_COUNT + 1];
+
+        int pathlen = strlen(server_path) + 1;
+        arg_types[0] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)pathlen;
+        args[0] = (void *)server_path;
+
+        arg_types[1] = (1u << ARG_INPUT) | (1u << ARG_ARRAY) | (ARG_CHAR << 16u) | (uint)(sizeof(struct timespec) * 2);
+        args[1] = (void *)ts;
+
+        arg_types[2] = (1u << ARG_OUTPUT) | (ARG_INT << 16u);
+        int ret_utimens;
+        args[2] = (void *)&ret_utimens;
+        arg_types[3] = 0;
+
+        rpcCall((char *)"utimensat", arg_types, args);
     }
 
     // Release WRITE lock.

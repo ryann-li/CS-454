@@ -1,0 +1,20 @@
+Traceback (most recent call last):
+  File "/u1/r465li/CS-454/provided-code/./watdfs_e2e_verification.py", line 618, in main
+    server_proc, client_proc, dirs = setup()
+                                     ^^^^^^^
+  File "/u1/r465li/CS-454/provided-code/./watdfs_e2e_verification.py", line 142, in setup
+    if dir_path.exists() and dir_path.name == "mount":
+       ^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 862, in exists
+    self.stat(follow_symlinks=follow_symlinks)
+  File "/usr/lib/python3.12/pathlib.py", line 842, in stat
+    return os.stat(self, follow_symlinks=follow_symlinks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 107] Transport endpoint is not connected: '/tmp/r465li/watdfs_e2e_test/mount'
+======================================================================
+🧪 WatDFS E2E Verification Suite - 10 Marmoset Tests
+======================================================================
+🔨 Building system...
+✅ Build successful
+
+❌ FATAL ERROR: [Errno 107] Transport endpoint is not connected: '/tmp/r465li/watdfs_e2e_test/mount'
